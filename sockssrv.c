@@ -259,24 +259,33 @@ static void send_auth_response(int fd, int version, enum authmethod meth) {
 	write(fd, buf, 2);
 }
 
-static void send_error(int fd, enum errorcode ec) {
+static void send_reply(int fd, enum errorcode ec, int remotefd) {
 	/* position 4 contains ATYP, the address type, which is the same as used in the connect
 	   request. we're lazy and return always IPV4 address type in errors. */
-	char buf[10] = { 5, ec, 0, 1 /*AT_IPV4*/, 0,0,0,0, 0,0 };
-	write(fd, buf, 10);
+	unsigned char buf[10] = { 5, ec, 0, 1 /*AT_IPV4*/, 0,0,0,0, 0,0 };
+	if(ec == EC_SUCCESS && remotefd >= 0) {
+		struct sockaddr_in sa;
+		socklen_t slen = sizeof(sa);
+		if(getsockname(remotefd, (struct sockaddr*)&sa, &slen) == 0 && sa.sin_family == AF_INET) {
+			memcpy(buf + 4, &sa.sin_addr, 4);
+			memcpy(buf + 8, &sa.sin_port, 2);
+		}
+	}
+	write(fd, buf, sizeof(buf));
 }
 
 static void copyloop(int fd1, int fd2) {
 	struct pollfd fds[2] = {
-		[0] = {.fd = fd1, .events = POLLIN},
-		[1] = {.fd = fd2, .events = POLLIN},
+		[0] = {.fd = fd1, .events = POLLIN | POLLERR | POLLHUP},
+		[1] = {.fd = fd2, .events = POLLIN | POLLERR | POLLHUP},
 	};
 
 	while(1) {
 		/* inactive connections are reaped after 15 min to free resources.
 		   usually programs send keep-alive packets so this should only happen
 		   when a connection is really unused. */
-		switch(poll(fds, 2, 60*15*1000)) {
+		int pr = poll(fds, 2, 60*15*1000);
+		switch(pr) {
 			case 0:
 				return;
 			case -1:
@@ -284,18 +293,27 @@ static void copyloop(int fd1, int fd2) {
 				else perror("poll");
 				return;
 		}
-		int infd = (fds[0].revents & POLLIN) ? fd1 : fd2;
-		int outfd = infd == fd2 ? fd1 : fd2;
-		/* since the biggest stack consumer in the entire code is
-		   libc's getaddrinfo(), we can safely use at least half the
-		   available stacksize to improve throughput. */
-		char buf[MIN(16*1024, THREAD_STACK_SIZE/2)];
-		ssize_t sent = 0, n = read(infd, buf, sizeof buf);
-		if(n <= 0) return;
-		while(sent < n) {
-			ssize_t m = write(outfd, buf+sent, n-sent);
-			if(m < 0) return;
-			sent += m;
+		for(int i = 0; i < 2; i++) {
+			if(fds[i].revents & (POLLERR | POLLHUP))
+				return;
+		}
+		for(int i = 0; i < 2; i++) {
+			if(!(fds[i].revents & POLLIN))
+				continue;
+			/* since the biggest stack consumer in the entire code is
+			   libc's getaddrinfo(), we can safely use at least half the
+			   available stacksize to improve throughput. */
+			char buf[MIN(16*1024, THREAD_STACK_SIZE/2)];
+			ssize_t sent = 0;
+			ssize_t n = read(fds[i].fd, buf, sizeof buf);
+			if(n <= 0)
+				return;
+			while(sent < n) {
+				ssize_t m = write(fds[1-i].fd, buf+sent, n-sent);
+				if(m < 0)
+					return;
+				sent += m;
+			}
 		}
 	}
 }
@@ -347,10 +365,10 @@ static int handshake(struct thread *t) {
 			case SS_3_AUTHED:
 				ret = connect_socks_target(buf, n, &t->client);
 				if(ret < 0) {
-					send_error(t->client.fd, ret*-1);
+					send_reply(t->client.fd, ret*-1, -1);
 					return -1;
 				}
-				send_error(t->client.fd, EC_SUCCESS);
+				send_reply(t->client.fd, EC_SUCCESS, ret);
 				return ret;
 		}
 	}
